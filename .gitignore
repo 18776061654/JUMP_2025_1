@@ -1,0 +1,13 @@
+# 忽略文件夹
+__pycache__
+.vscode
+results
+
+# 忽略特定文件
+# .env
+# config/settings.json
+
+# 忽略所有 `.log` 文件
+*.log
+
+

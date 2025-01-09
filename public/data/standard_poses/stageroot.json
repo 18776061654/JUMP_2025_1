@@ -1,0 +1,43 @@
+{
+    "timestamp": "2024-12-26 18:05:26",
+    "total_stages": 3,
+    "stages": [
+        {
+            "id": "takeoff",
+            "name": "起跳",
+            "info": {
+                "name": "takeoff",
+                "start": 0.0,
+                "end": 0.2964930924548353,
+                "pixel_start": 0,
+                "pixel_end": 279
+            }
+        },
+        {
+            "id": "flight",
+            "name": "空中",
+            "info": {
+                "name": "flight",
+                "start": 0.20085015940488843,
+                "end": 0.8522848034006376,
+                "pixel_start": 189,
+                "pixel_end": 802
+            }
+        },
+        {
+            "id": "landing",
+            "name": "落地",
+            "info": {
+                "name": "landing",
+                "start": 0.6663124335812965,
+                "end": 1.0,
+                "pixel_start": 627,
+                "pixel_end": 941
+            }
+        }
+    ],
+    "image_size": {
+        "width": 1280,
+        "height": 720
+    }
+}

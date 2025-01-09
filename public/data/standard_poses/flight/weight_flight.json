@@ -1,0 +1,50 @@
+[
+    {
+        "key_angle": [10, 6],
+        "vertex_index": 1,
+        "weight": 0.2,
+        "angle": 30,
+        "angle_type": "vertical",
+        "direction": "up",
+        "score_ranges": [
+            {"range": [0, 30], "score": 59, "min_score": 0},
+            {"range": [30, 90], "score": 100, "min_score": 60},
+            {"range": [90, 180], "score": 59, "min_score": 0}
+        ]
+    },
+    {
+        "key_angle": [9, 5],
+        "vertex_index": 1,
+        "weight": 0.2,
+        "angle": 30,
+        "angle_type": "vertical",
+        "direction": "up",
+        "score_ranges": [
+            {"range": [0, 30], "score": 59, "min_score": 0},
+            {"range": [30, 90], "score": 100, "min_score": 60},
+            {"range": [90, 180], "score": 59, "min_score": 0}
+        ]
+    },
+    {
+        "key_angle": [6, 12, 14],
+        "vertex_index": 1,
+        "weight": 0.3,
+        "angle": 165,
+        "angle_type": "normal",
+        "score_ranges": [
+            {"range": [0, 150], "score": 59, "min_score": 0},
+            {"range": [150, 180], "score": 100, "min_score": 60}
+        ]
+    },
+    {
+        "key_angle": [5, 11, 13],
+        "vertex_index": 1,
+        "weight": 0.3,
+        "angle": 165,
+        "angle_type": "normal",
+        "score_ranges": [
+            {"range": [0, 150], "score": 59, "min_score": 0},
+            {"range": [150, 180], "score": 100, "min_score": 60}
+        ]
+    }
+]
