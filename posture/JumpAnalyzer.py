@@ -9,6 +9,11 @@ from tkinter import filedialog
 import os
 from Human.Human import Human
 from posture.JumperTracker import Sort, KalmanBoxTracker
+from posture.BiLSTMActionSegmentation import BiLSTMActionSegmentation
+from posture.DTWCosineMatcher import DTWCosineMatcher
+from posture.RelativeL2Scorer import RelativeL2Scorer
+import torch
+import datetime
 
 class JumpAnalyzer:
     def __init__(self):
@@ -62,6 +67,41 @@ class JumpAnalyzer:
         self.total_frames = 0
         self.current_frame = 0
         
+        # 初始化Bi-LSTM模型
+        self.model = BiLSTMActionSegmentation(input_size=34, hidden_size=64, num_layers=2, num_classes=3)  # 假设有3个阶段
+        self.model.eval()  # 设置为评估模式
+        
+        # 初始化DTW余弦相似度匹配器
+        self.pose_matcher = DTWCosineMatcher(threshold=0.75)
+        
+        # 初始化相对L₂评分器
+        self.pose_scorer = RelativeL2Scorer()
+        
+        # 存储阶段预测结果
+        self.phase_predictions = []
+        
+        # 参考姿态数据路径
+        self.reference_data_path = 'data/reference_poses.json'
+        self.reference_keypoints = None
+        self.reference_predictions = None
+        
+        # 加载参考姿态数据（如果存在）
+        self.load_reference_data()
+        
+    def load_reference_data(self):
+        """加载参考姿态数据"""
+        try:
+            if os.path.exists(self.reference_data_path):
+                with open(self.reference_data_path, 'r') as f:
+                    reference_data = json.load(f)
+                    self.reference_keypoints = np.array(reference_data.get('keypoints', []))
+                    self.reference_predictions = np.array(reference_data.get('predictions', []))
+                    print(f"已加载参考姿态数据，共{len(self.reference_keypoints)}帧")
+        except Exception as e:
+            print(f"加载参考姿态数据失败: {e}")
+            self.reference_keypoints = None
+            self.reference_predictions = None
+        
     def set_start_zone(self, x: int, y: int, width: int, height: int):
         """设置起跳预备区域"""
         self.start_zone = (x, y, width, height)
@@ -83,6 +123,13 @@ class JumpAnalyzer:
         cap = cv2.VideoCapture(video_path)
         self.total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.current_frame = 0
+        
+        # 重置轨迹和预测数据
+        self.trajectory = []
+        self.phase_predictions = []
+        
+        # 批处理关键点，用于Bi-LSTM模型的输入
+        keypoints_batch = []
         
         while cap.isOpened():
             ret, frame = cap.read()
@@ -120,17 +167,34 @@ class JumpAnalyzer:
                                 self.target_id = len(self.trajectory)
                         
                         if self.tracking_active:
+                            # 收集关键点用于批处理
+                            keypoints_batch.append(keypoints)
+                            
+                            # 将关键点数据转换为模型输入格式
+                            keypoints_input = self.prepare_keypoints_for_model(keypoints)
+                            
+                            # 使用Bi-LSTM模型进行阶段划分
+                            with torch.no_grad():
+                                outputs = self.model(torch.tensor(keypoints_input).unsqueeze(0))
+                                _, predicted_phase = torch.max(outputs, 1)
+                            
+                            # 记录阶段信息
+                            phase_id = predicted_phase.item()
+                            self.phase_predictions.append(phase_id)
+                            
                             # 记录关键点和分数
                             frame_info = {
                                 'frame_id': self.current_frame,
                                 'keypoints': keypoints.tolist(),
                                 'scores': keypoint_scores.tolist(),
-                                'bbox': bbox.tolist()
+                                'bbox': bbox.tolist(),
+                                'predicted_phase': phase_id,
+                                'phase_name': ['takeoff', 'flight', 'landing'][phase_id] if phase_id < 3 else f'phase_{phase_id}'
                             }
                             self.trajectory.append(frame_info)
                             
                             # 在帧上绘制结果
-                            self.draw_results(frame, bbox, keypoints, keypoint_scores)
+                            self.draw_results(frame, bbox, keypoints, keypoint_scores, phase_id)
                 
                 # 更新进度
                 self.current_frame += 1
@@ -145,9 +209,95 @@ class JumpAnalyzer:
                 traceback.print_exc()  # 打印完整的错误堆栈
                 continue
         
+        # 视频处理完成后，执行姿态匹配和评估
+        if self.tracking_active and self.reference_keypoints is not None:
+            try:
+                # 将关键点转换为numpy数组
+                all_keypoints = np.array([frame_info['keypoints'] for frame_info in self.trajectory])
+                all_predictions = np.array(self.phase_predictions)
+                
+                # 使用DTW和余弦相似度进行姿态匹配和评估
+                alignment_result = self.pose_matcher.evaluate_performance(
+                    self.reference_keypoints, 
+                    all_keypoints, 
+                    all_predictions
+                )
+                
+                # 保存匹配结果
+                self.save_alignment_results(alignment_result, os.path.join(os.path.dirname(video_path), 'alignment_result.json'))
+                
+                # 可视化匹配结果
+                self.pose_matcher.visualize_alignment(
+                    self.pose_matcher.segment_phases(self.pose_matcher.preprocess_keypoints(self.reference_keypoints), self.reference_predictions),
+                    self.pose_matcher.segment_phases(self.pose_matcher.preprocess_keypoints(all_keypoints), all_predictions),
+                    alignment_result,
+                    os.path.join(os.path.dirname(video_path), 'alignment_plots')
+                )
+                
+                # 生成姿态匹配报告
+                self.pose_matcher.generate_alignment_report(
+                    alignment_result,
+                    os.path.join(os.path.dirname(video_path), 'alignment_report.json')
+                )
+                
+                # 使用相对L₂距离进行动作评分
+                self.evaluate_jump_performance(
+                    all_keypoints, 
+                    all_predictions,
+                    os.path.join(os.path.dirname(video_path), 'score_result.json')
+                )
+                
+            except Exception as e:
+                print(f"执行姿态匹配和评分时出错: {str(e)}")
+                import traceback
+                traceback.print_exc()
+        
         cap.release()
+    
+    def evaluate_jump_performance(self, keypoints, predictions, output_path):
+        """评估跳远表现并生成评分报告"""
+        try:
+            if self.reference_keypoints is None or len(self.reference_keypoints) == 0:
+                print("未找到参考姿态数据，无法评分")
+                return False
+                
+            # 预处理关键点数据
+            target_keypoints = self.pose_matcher.preprocess_keypoints(keypoints)
+            reference_keypoints = self.pose_matcher.preprocess_keypoints(self.reference_keypoints)
+            
+            # 分割动作阶段
+            target_phases = self.pose_matcher.segment_phases(target_keypoints, predictions)
+            reference_phases = self.pose_matcher.segment_phases(reference_keypoints, self.reference_predictions)
+            
+            # 计算相对L₂评分
+            score_result = self.pose_scorer.score_jump_performance(target_phases, reference_phases)
+            
+            # 保存评分结果
+            self.pose_scorer.save_score_report(score_result, output_path)
+            
+            print(f"\n评分结果: 总分 {score_result['overall_score']:.2f}")
+            print(f"整体评价: {score_result['overall_evaluation']}")
+            
+            # 打印各阶段得分
+            print("\n各阶段得分:")
+            for phase in score_result['phase_evaluations']:
+                print(f"- {phase['phase_name']}: {phase['score']:.2f} ({phase['evaluation']})")
+            
+            # 打印改进建议
+            if score_result['suggestions']:
+                print("\n改进建议:")
+                for suggestion in score_result['suggestions']:
+                    print(f"- {suggestion}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"评估跳远表现时出错: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return False
 
-    def draw_results(self, frame: np.ndarray, bbox: np.ndarray, keypoints: np.ndarray, keypoint_scores: np.ndarray):
+    def draw_results(self, frame: np.ndarray, bbox: np.ndarray, keypoints: np.ndarray, keypoint_scores: np.ndarray, phase_id=None):
         """绘制检测框、骨架和关键点"""
         try:
             # 确保bbox是正确的格式
@@ -156,7 +306,15 @@ class JumpAnalyzer:
                 # 绘制检测框
                 x1, y1, x2, y2 = bbox
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(frame, f"ID: {self.target_id}", 
+                
+                # 添加ID和阶段信息
+                info_text = f"ID: {self.target_id}"
+                if phase_id is not None:
+                    phase_names = ["起跳", "腾空", "收腹"]
+                    if 0 <= phase_id < len(phase_names):
+                        info_text += f" | {phase_names[phase_id]}"
+                
+                cv2.putText(frame, info_text, 
                            (x1, y1 - 10),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                 
@@ -204,7 +362,8 @@ class JumpAnalyzer:
                     'target_id': self.target_id,
                     'start_zone': self.start_zone
                 },
-                'trajectory': self.trajectory
+                'trajectory': self.trajectory,
+                'phase_predictions': self.phase_predictions
             }
             
             # 确保输出目录存在
@@ -218,6 +377,34 @@ class JumpAnalyzer:
             
         except Exception as e:
             print(f"保存结果时出错: {str(e)}")
+    
+    def save_alignment_results(self, alignment_result, output_path):
+        """保存姿态对齐结果"""
+        try:
+            # 转换numpy数组为列表，以便JSON序列化
+            json_compatible_result = {}
+            for key, value in alignment_result.items():
+                if key == 'overall_similarity':
+                    json_compatible_result[key] = float(value)
+                else:
+                    json_compatible_result[key] = {
+                        'distance': float(value['distance']),
+                        'path': [[int(i), int(j)] for i, j in value['path']],
+                        'similarity': float(value['similarity']),
+                        'reference_length': int(value['reference_length']),
+                        'target_length': int(value['target_length'])
+                    }
+            
+            # 确保输出目录存在
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            
+            # 保存为JSON文件
+            with open(output_path, 'w') as f:
+                json.dump(json_compatible_result, f, indent=4)
+                
+            print(f"\n姿态对齐结果已保存到: {output_path}")
+        except Exception as e:
+            print(f"保存姿态对齐结果时出错: {str(e)}")
 
     def keypoints_to_bbox(self, keypoints):
         """将关键点转换为边界框"""
@@ -256,7 +443,7 @@ class JumpAnalyzer:
         
         except Exception as e:
             print(f"计算边界框时出错: {str(e)}")
-            return np.array([0, 0, 100, 100])  # 返回一��默认的边界框
+            return np.array([0, 0, 100, 100])  # 返回一个默认的边界框
 
     def process_frame_for_display(self, frame):
         """处理单帧用于显示"""
@@ -281,9 +468,15 @@ class JumpAnalyzer:
                     # 转换为边界框
                     bbox = self.keypoints_to_bbox(keypoints)
                     
+                    # 使用Bi-LSTM模型进行阶段预测
+                    keypoints_input = self.prepare_keypoints_for_model(keypoints)
+                    with torch.no_grad():
+                        outputs = self.model(torch.tensor(keypoints_input).unsqueeze(0))
+                        _, predicted_phase = torch.max(outputs, 1)
+                    
                     # 在帧上绘制结果
                     frame_with_pose = frame.copy()
-                    self.draw_results(frame_with_pose, bbox, keypoints, keypoint_scores)
+                    self.draw_results(frame_with_pose, bbox, keypoints, keypoint_scores, predicted_phase.item())
                     return frame_with_pose
             
             return frame
@@ -291,177 +484,52 @@ class JumpAnalyzer:
         except Exception as e:
             print(f"处理帧时出错: {str(e)}")
             return frame
-
-def main():
-    """主函数"""
-    # 创建 Tkinter 根窗口
-    root = tk.Tk()
-    root.withdraw()  # 隐藏主窗口
-
-    # 打开文件选择对话框
-    video_path = filedialog.askopenfilename(
-        title="选择视频文件",
-        filetypes=[
-            ("Video files", "*.mp4 *.avi *.mov"),
-            ("All files", "*.*")
-        ]
-    )
-
-    if not video_path:
-        print("未选择视频文件")
-        return
-
-    print(f"已选择视频文件: {video_path}")
-
-    # 打开视频
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print("无法打开视频文件")
-        return
-
-    # 获取视频信息
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
-    print(f"\n视频信息:")
-    print(f"总帧数: {total_frames}")
-    print(f"帧率: {fps} fps")
-    print(f"预计时长: {total_frames/fps:.1f} 秒")
-
-    # 读取第一帧
-    ret, first_frame = cap.read()
-    if not ret:
-        print("无法读取视频帧")
-        cap.release()
-        return
-
-    print("\n请在视频第一帧中选择起跳预备区域（点击两个点以��定矩形区域）...")
-    # 让用户选择预备区域
-    roi = select_roi(first_frame.copy())
-    if roi is None:
-        print("未选择预备区域")
-        cap.release()
-        return
-
-    print(f"已设置预备区域: {roi}")
-
-    # 创建分析器
-    analyzer = JumpAnalyzer()
-    analyzer.set_start_zone(*roi)
-
-    # 创建结果目录
-    result_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'result')
-    os.makedirs(result_dir, exist_ok=True)
-
-    # 设置输出文件路径
-    video_name = os.path.splitext(os.path.basename(video_path))[0]
-    output_video_path = os.path.join(result_dir, f"{video_name}_analyzed.mp4")
-    output_json_path = os.path.join(result_dir, f"{video_name}_analysis.json")
-
-    # 创建输出视频写入器
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    out = cv2.VideoWriter(output_video_path, fourcc, fps, (frame_width, frame_height))
-
-    # 重置视频到开始
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-
-    print("\n开始处理视频...")
-    frame_count = 0
-    tracking_started = False
-    try:
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            frame_count += 1
-            # 计算进度
-            progress = (frame_count / total_frames) * 100
+    
+    def prepare_keypoints_for_model(self, keypoints):
+        """准备关键点数据以输入到Bi-LSTM模型"""
+        # 假设关键点是一个17x2的数组，转换为34维的输入
+        return keypoints.flatten()
+    
+    def save_as_reference(self, output_path=None):
+        """将当前分析结果保存为参考姿态数据"""
+        if not self.trajectory:
+            print("没有可保存的轨迹数据")
+            return False
             
-            # 处理当前帧
-            processed_frame, frame_info = analyzer.process_frame(frame, frame_count - 1)
-
-            # 显示进度信息
-            if frame_info:
-                if not tracking_started:
-                    print("\n检测到目标进入预备区域，开始追踪和姿态估计...")
-                    tracking_started = True
-                status = "正在追踪和分析"
-            else:
-                status = "等待目标进入预备区域" if not tracking_started else "追踪中"
-
-            print(f"\r处理进度: {frame_count}/{total_frames} ({progress:.1f}%) - {status}", end="")
-
-            # 显示处理后的帧
-            cv2.imshow("Analysis", processed_frame)
-            out.write(processed_frame)
-
-            # 按'q'退出
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                print("\n用户中断处理")
-                break
-
-    finally:
-        # 保存结果
-        if analyzer.trajectory:
-            analyzer.save_results(output_json_path)
-            print(f"\n\n处理完成!")
-            print(f"已保存:")
-            print(f"- 处理后的视频: {output_video_path}")
-            print(f"- 分析数据: {output_json_path}")
-            print(f"\n分析统计:")
-            print(f"- 总帧数: {total_frames}")
-            print(f"- 分析数: {len(analyzer.trajectory)}")
-            print(f"- 分析成功率: {(len(analyzer.trajectory)/total_frames)*100:.1f}%")
-        else:
-            print("\n\n处理完成，但未能成功追踪和分析目标")
-
-        # 释放资源
-        cap.release()
-        out.release()
-        cv2.destroyAllWindows()
-
-def select_roi(frame):
-    """
-    让用户在视频第一帧选择两个点来创建预备区域
-    :param frame: 视频第一帧
-    :return: (x, y, width, height) 或 None
-    """
-    points = []
-    
-    def mouse_callback(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            points.append((x, y))
-            # 绘制点
-            cv2.circle(frame, (x, y), 3, (0, 255, 0), -1)
-            if len(points) == 2:
-                # 绘制矩形
-                x1, y1 = points[0]
-                x2, y2 = points[1]
-                cv2.rectangle(frame, points[0], points[1], (255, 0, 0), 2)
-            cv2.imshow("Select ROI", frame)
-
-    # 创建窗口并设置鼠标回调
-    cv2.imshow("Select ROI", frame)
-    cv2.setMouseCallback("Select ROI", mouse_callback)
-
-    while len(points) < 2:
-        if cv2.waitKey(1) & 0xFF == 27:  # ESC键退出
-            cv2.destroyWindow("Select ROI")
-            return None
-    
-    cv2.destroyWindow("Select ROI")
-    
-    # 计算矩形坐标
-    x1, y1 = points[0]
-    x2, y2 = points[1]
-    x = min(x1, x2)
-    y = min(y1, y2)
-    width = abs(x2 - x1)
-    height = abs(y2 - y1)
-    
-    return (x, y, width, height)
-
-if __name__ == "__main__":
-    main() 
+        try:
+            # 准备要保存的数据
+            all_keypoints = [frame_info['keypoints'] for frame_info in self.trajectory]
+            
+            reference_data = {
+                'keypoints': all_keypoints,
+                'predictions': self.phase_predictions,
+                'metadata': {
+                    'total_frames': len(self.trajectory),
+                    'date_created': str(datetime.datetime.now())
+                }
+            }
+            
+            # 确定保存路径
+            if output_path is None:
+                output_path = self.reference_data_path
+                
+            # 确保输出目录存在
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            
+            # 保存为JSON文件
+            with open(output_path, 'w') as f:
+                json.dump(reference_data, f, indent=4)
+                
+            print(f"\n参考姿态数据已保存到: {output_path}")
+            
+            # 更新当前的参考数据
+            self.reference_keypoints = np.array(all_keypoints)
+            self.reference_predictions = np.array(self.phase_predictions)
+            
+            return True
+            
+        except Exception as e:
+            print(f"保存参考姿态数据时出错: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return False
